@@ -1,0 +1,139 @@
+; CEX Virtual NPU -- Windows Device Installation File
+; cex_virt_npu.inf
+;
+; Installs the WDDM compute-accelerator device that appears as
+; "NPU" in Windows Task Manager (Windows 11 23H2 Build 22631+).
+;
+; Installation (test-signing mode required for unsigned driver):
+;   bcdedit /set testsigning on                    (requires reboot)
+;   devcon install cex_virt_npu.inf Root\CexVirtualNPU
+;
+; Production (attestation-signed):
+;   Submit to https://partner.microsoft.com/en-us/dashboard/hardware
+;   Use "Attestation signing" for test distribution.
+;   Use "WHQL" for public distribution via Windows Update.
+
+[Version]
+Signature            = "$WINDOWS NT$"
+Class                = ComputeAccelerator
+ClassGuid            = {B50C5E87-6938-4660-BCFE-84C53E5FA2FA}
+Provider             = %ManufacturerName%
+DriverVer            = 06/14/2026,1.0.0.0
+CatalogFile          = cex_virt_npu.cat
+PnpLockdown          = 1
+
+[DestinationDirs]
+DefaultDestDir      = 12    ; %windir%\System32\drivers
+UMDriverCopySection = 11    ; %windir%\System32  (user-mode driver DLL)
+
+[ClassInstall32]
+Addreg = ComputeAcceleratorClassReg
+
+[ComputeAcceleratorClassReg]
+HKR,,,0,%ClassName%
+HKR,,Icon,,-5
+HKR,,DeviceCharacteristics,0x10001,0x100    ; FILE_DEVICE_SECURE_OPEN
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+; ===================================================================
+; Manufacturer and device models
+; ===================================================================
+
+[Manufacturer]
+%ManufacturerName% = Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceName% = Device_Install, Root\CexVirtualNPU
+
+; ===================================================================
+; Device installation sections
+; ===================================================================
+
+[Device_Install.NTamd64]
+CopyFiles       = KMDriverCopySection
+CopyFiles       = UMDriverCopySection
+AddReg          = Device_AddReg
+
+[Device_Install.NTamd64.Services]
+AddService = CexVirtNpu, 0x00000002, KMService_Inst, KMService_EventLog
+
+[Device_Install.NTamd64.Wdf]
+KmdfService = CexVirtNpu, KMWdf_Inst
+
+; ===================================================================
+; File copy sections
+; ===================================================================
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+cex_virt_npu.sys = 1,,
+cex_npu_ep.dll   = 1,,
+
+[KMDriverCopySection]
+cex_virt_npu.sys
+
+[UMDriverCopySection]
+cex_npu_ep.dll
+
+; ===================================================================
+; Registry entries
+; ===================================================================
+
+[Device_AddReg]
+; Mark as compute-only (no display output)
+HKR, "Parameters",           "IsComputeOnly",       0x00010001, 1
+; Adapter description shown in Device Manager
+HKR, "Parameters",           "AdapterDescription",  0x00000000, %DeviceName%
+; Vendor and device IDs (synthetic -- no physical PCIe device)
+HKR, "Parameters",           "VendorID",            0x00010001, 0x0000CEA1
+HKR, "Parameters",           "DeviceID",            0x00010001, 0x00004E50
+; Proxy server connection (can be overridden by installer)
+HKR, "Parameters",           "ServerHost",          0x00000000, ""
+HKR, "Parameters",           "ServerPort",          0x00010001, 7474
+; User-mode EP DLL registration for ONNX Runtime
+HKR, "Parameters",           "OrtEpDllPath",        0x00000000, "%SystemRoot%\System32\cex_npu_ep.dll"
+
+; ===================================================================
+; WDDM User-Mode Driver registration
+; Tells DXGKRNL which UM DLL to load alongside the kernel driver
+; ===================================================================
+[Device_Install.NTamd64.HW]
+AddReg = UMDriver_AddReg
+
+[UMDriver_AddReg]
+HKR,, UserModeDriverName,    0x00010000, "cex_npu_ep.dll"
+HKR,, UserModeDriverType,    0x00010001, 0x00000001    ; WDDM UM driver
+
+; ===================================================================
+; Kernel driver service
+; ===================================================================
+
+[KMService_Inst]
+DisplayName    = %ServiceName%
+ServiceType    = 1                ; SERVICE_KERNEL_DRIVER
+StartType      = 3                ; SERVICE_DEMAND_START
+ErrorControl   = 1                ; SERVICE_ERROR_NORMAL
+ServiceBinary  = %12%\cex_virt_npu.sys
+
+[KMWdf_Inst]
+KmdfLibraryVersion = 1.33
+
+[KMService_EventLog]
+AddReg = KMService_EventLog_AddReg
+
+[KMService_EventLog_AddReg]
+HKR,, EventMessageFile, 0x00020000, "%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,, TypesSupported,   0x00010001, 7
+
+; ===================================================================
+; Strings
+; ===================================================================
+
+[Strings]
+ManufacturerName = "CEX AI Systems"
+ClassName        = "Compute Accelerator"
+DeviceName       = "CEX Virtual NPU (LAN)"
+ServiceName      = "CEX Virtual NPU Driver"
+DiskName         = "CEX Virtual NPU Installation Disk"

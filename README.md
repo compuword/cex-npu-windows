@@ -77,5 +77,5 @@ copy build\Release\cex_npu_ep.dll C:\Windows\System32\
 
 ## Related
 
-- [cex-npu-linux](https://github.com/brunodanna/cex-npu-linux) -- ARM Linux NPU server
-- [cex-orchestrator](https://github.com/brunodanna/cex-orchestrator) -- Orchestrator + GPU routing
+- [cex-npu-linux](https://github.com/compuword/cex-npu-linux) -- ARM Linux NPU server
+- [cex-orchestrator](https://github.com/compuword/cex-orchestrator) -- Orchestrator + GPU routing

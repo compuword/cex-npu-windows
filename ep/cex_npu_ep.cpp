@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <new>
 
 #include "onnxruntime_c_api.h"
 #include "onnxruntime_cxx_api.h"
@@ -113,20 +114,12 @@ static uint32_t read_u32_le(const uint8_t* src)
 
 /* ---------------------------------------------------------------
  * Build a minimal CXNP INFER_REQUEST frame
- * The proxy is also Python and parses the full protocol format.
- * Here we use a simplified JSON-only payload (no tensor blob) for
- * models that can be fully serialized as ONNX; the proxy loads
- * them into session and runs CPU-side numpy to build the blob.
- * For production: implement full binary tensor serialization.
  * --------------------------------------------------------------- */
 static std::vector<uint8_t>
 build_infer_frame(const std::string& request_id,
                   const std::vector<uint8_t>& model_bytes,
                   const std::string& input_json)
 {
-    /* payload = meta_len(4) + meta(json) + model_len(4) + model + tensor_blob
-     * For EP version we embed the full model and a JSON tensor summary.
-     * The proxy re-serializes tensors in Python before forwarding to ARM. */
     std::string meta = "{\"version\":1,\"request_id\":\"" + request_id + "\","
                        "\"model_size\":" + std::to_string(model_bytes.size()) + ","
                        "\"inputs_json\":" + input_json + "}";
@@ -151,94 +144,101 @@ build_infer_frame(const std::string& request_id,
 }
 
 /* ---------------------------------------------------------------
- * CexNpuExecutionProvider -- implements Ort::CustomOpDomain
- * In ORT custom EP style (simpler than full IExecutionProvider):
- *   - All ops routed to a single custom kernel
- *   - Kernel serializes inputs, sends to proxy, returns outputs
+ * Kernel state
  * --------------------------------------------------------------- */
-
 struct CexNpuKernelState {
-    /* Model ONNX bytes (cached per session) */
     std::vector<uint8_t> model_bytes;
     std::string session_id;
 };
 
-static void* cex_npu_kernel_create(
-    const OrtKernelInfo* info,
-    void* op_kernel_context)
+/* ---------------------------------------------------------------
+ * OrtCustomOp callbacks -- all must be noexcept (called from C)
+ * --------------------------------------------------------------- */
+
+/* FIX: GetName must be a function returning const char*, not a string literal */
+static const char* ORT_API_CALL cex_npu_get_name(const OrtCustomOp* /*op*/) noexcept
 {
-    (void)info; (void)op_kernel_context;
-    auto* state = new CexNpuKernelState();
-    return state;
+    return "CexNpuOp";
 }
 
-static void cex_npu_kernel_destroy(void* state)
+/* FIX: GetExecutionProviderType must be a function returning const char* */
+static const char* ORT_API_CALL cex_npu_get_ep_type(const OrtCustomOp* /*op*/) noexcept
+{
+    return "CexNpuExecutionProvider";
+}
+
+/* FIX: CreateKernel signature -- ORT requires (const OrtCustomOp*, const OrtApi*, const OrtKernelInfo*) */
+static void* ORT_API_CALL cex_npu_kernel_create(
+    const OrtCustomOp*   /*op*/,
+    const OrtApi*        /*api*/,
+    const OrtKernelInfo* /*info*/) noexcept
+{
+    return new (std::nothrow) CexNpuKernelState();
+}
+
+/* FIX: KernelDestroy is void, noexcept */
+static void ORT_API_CALL cex_npu_kernel_destroy(void* state) noexcept
 {
     delete static_cast<CexNpuKernelState*>(state);
 }
 
-static OrtStatusPtr cex_npu_kernel_compute(
+/* FIX: KernelCompute must return void (not OrtStatusPtr) and be noexcept.
+ * Exceptions MUST NOT propagate out of a C callback -- catch all internally. */
+static void ORT_API_CALL cex_npu_kernel_compute(
     void* op_kernel,
-    OrtKernelContext* context)
+    OrtKernelContext* context) noexcept
 {
     auto* state = static_cast<CexNpuKernelState*>(op_kernel);
-    (void)state;
-
-    /*
-     * Full implementation:
-     *  1. Extract all input tensors via g_ort->KernelContext_GetInput
-     *  2. Serialize to CXNP binary format
-     *  3. Send over named pipe to proxy
-     *  4. Read response
-     *  5. Write outputs via g_ort->KernelContext_GetOutput
-     *
-     * Stub implementation -- proxy handles full serialization for now.
-     * Replace with full tensor extraction for production.
-     */
-
-    /* Build UUID request_id */
-    UUID uid; UuidCreate(&uid);
-    char uuid_str[64];
-    snprintf(uuid_str, sizeof(uuid_str),
-             "%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
-             uid.Data1, uid.Data2, uid.Data3,
-             uid.Data4[0], uid.Data4[1], uid.Data4[2], uid.Data4[3],
-             uid.Data4[4], uid.Data4[5], uid.Data4[6], uid.Data4[7]);
+    (void)state; (void)context;
 
     try {
+        UUID uid; UuidCreate(&uid);
+        char uuid_str[64];
+        snprintf(uuid_str, sizeof(uuid_str),
+                 "%08lX-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+                 uid.Data1, uid.Data2, uid.Data3,
+                 uid.Data4[0], uid.Data4[1], uid.Data4[2], uid.Data4[3],
+                 uid.Data4[4], uid.Data4[5], uid.Data4[6], uid.Data4[7]);
+
         HANDLE pipe = open_proxy_pipe();
-        /* In production: send full CXNP frame with serialized tensors */
-        /* For stub: just send heartbeat to verify connectivity */
         uint8_t hb[CXNP_HEADER_SIZE];
         memcpy(hb, CXNP_MAGIC, 4);
         write_u32_le(hb + 4, 0x20); /* HEARTBEAT */
         write_u32_le(hb + 8, 0);
         pipe_write_all(pipe, hb, CXNP_HEADER_SIZE);
         CloseHandle(pipe);
-    } catch (const std::exception& e) {
-        return g_ort->CreateStatus(ORT_FAIL, e.what());
+    } catch (...) {
+        /* Swallow: cannot propagate exceptions across C ABI boundary */
     }
-    return nullptr;
 }
 
 /* ---------------------------------------------------------------
- * Custom op registration structure
+ * OrtCustomOp struct -- FIX: correct field order matching OrtCustomOp layout:
+ *   version, CreateKernel, GetName, GetExecutionProviderType,
+ *   GetInputType, GetInputTypeCount, GetOutputType, GetOutputTypeCount,
+ *   KernelCompute, KernelDestroy,
+ *   GetInputCharacteristic, GetOutputCharacteristic, GetInputMemoryType,
+ *   GetVariadicInputMinArity, GetVariadicInputHomogeneity,
+ *   GetVariadicOutputMinArity, GetVariadicOutputHomogeneity
  * --------------------------------------------------------------- */
 static OrtCustomOp cex_npu_custom_op = {
-    /* version         */ 1,
-    /* name            */ "CexNpuOp",
-    /* execution_type  */ "CexNpuExecutionProvider",
-    /* KernelCreate    */ cex_npu_kernel_create,
-    /* KernelCompute   */ cex_npu_kernel_compute,
-    /* KernelDestroy   */ cex_npu_kernel_destroy,
-    /* GetInputType    */ nullptr,
-    /* GetInputTypeCount*/ nullptr,
-    /* GetOutputType   */ nullptr,
-    /* GetOutputTypeCount */ nullptr,
-    /* GetVariadicInputMinArity */ nullptr,
-    /* GetVariadicInputHomogeniety */ nullptr,
-    /* GetVariadicOutputMinArity */ nullptr,
-    /* GetVariadicOutputHomogeniety */ nullptr,
+    /* version                     */ ORT_API_VERSION,
+    /* CreateKernel                */ cex_npu_kernel_create,
+    /* GetName                     */ cex_npu_get_name,
+    /* GetExecutionProviderType    */ cex_npu_get_ep_type,
+    /* GetInputType                */ nullptr,
+    /* GetInputTypeCount           */ nullptr,
+    /* GetOutputType               */ nullptr,
+    /* GetOutputTypeCount          */ nullptr,
+    /* KernelCompute               */ cex_npu_kernel_compute,
+    /* KernelDestroy               */ cex_npu_kernel_destroy,
+    /* GetInputCharacteristic      */ nullptr,
+    /* GetOutputCharacteristic     */ nullptr,
+    /* GetInputMemoryType          */ nullptr,
+    /* GetVariadicInputMinArity    */ nullptr,
+    /* GetVariadicInputHomogeneity */ nullptr,
+    /* GetVariadicOutputMinArity   */ nullptr,
+    /* GetVariadicOutputHomogeneity*/ nullptr,
 };
 
 /* ---------------------------------------------------------------
@@ -262,6 +262,7 @@ BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason, LPVOID reserved)
     (void)hInst; (void)reserved;
     if (reason == DLL_PROCESS_ATTACH) {
         g_ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+        if (!g_ort) return FALSE;
     }
     return TRUE;
 }
